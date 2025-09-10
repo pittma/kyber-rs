@@ -52,6 +52,10 @@ pub(crate) fn chi(state: &mut State) {
     *state = out;
 }
 
+pub(crate) fn iota(round_num: u8, state: &mut State) {
+    state[0][0] ^= rc(round_num);
+}
+
 fn lfsr(t: u8) -> bool {
     if t == 0 {
         return true;
@@ -80,9 +84,6 @@ fn rc(round_num: u8) -> u64 {
     out
 }
 
-pub(crate) fn iota(round_num: u8, state: &mut State) {
-    state[0][0] ^= rc(round_num);
-}
 #[cfg(test)]
 mod test {
 

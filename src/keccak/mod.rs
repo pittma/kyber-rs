@@ -12,11 +12,22 @@ impl State {
         State { data: [[0; 5]; 5] }
     }
 
-    pub fn to_vec(&self) -> Vec<u64> {
-        self.data.iter().fold(vec![], |mut out, inner| {
-            out.extend(inner);
-            out
-        })
+    fn xor(&mut self, rhs: &[u64]) {
+        let (mut x, mut y) = (0, 0);
+        for word in rhs {
+            self.data[x][y] ^= *word;
+            (x, y) = if x == 4 { (0, y + 1) } else { (x + 1, y) };
+        }
+    }
+
+    fn first_n(&self, n: usize) -> Vec<u64> {
+        let mut out = vec![];
+        let (mut x, mut y) = (0, 0);
+        for _ in 0..n {
+            out.push(self.data[x][y]);
+            (x, y) = if x == 4 { (0, y + 1) } else { (x + 1, y) };
+        }
+        out
     }
 }
 
@@ -34,6 +45,25 @@ impl IndexMut<usize> for State {
     }
 }
 
+impl<T: AsRef<[u8]>> From<T> for State {
+    fn from(bytes: T) -> Self {
+        let mut state = Self::new();
+        let mut x = 0;
+        let mut y = 0;
+        for i in 0..25 {
+            let cursor = i * 8;
+            let u64slice = &bytes.as_ref()[cursor..cursor + 8];
+            let mut val: u64 = 0;
+            for j in 0..8 {
+                val |= (u64slice[j] as u64) << (j * 8);
+            }
+            state[x][y] = val;
+            (x, y) = if x == 4 { (0, y + 1) } else { (x + 1, y) };
+        }
+        state
+    }
+}
+
 /// Implements KECCAK-p, in place, on `state`.
 pub fn keccak_p(state: &mut State) {
     for i in 0..24 {
@@ -45,6 +75,81 @@ pub fn keccak_p(state: &mut State) {
     }
 }
 
+fn pad101(dom: u8, mod_len: usize, len: usize) -> Vec<u8> {
+    let pad_len = mod_len - ((len + 2) % mod_len);
+    let mut out = vec![dom];
+    out.append(&mut [0].repeat(pad_len));
+    out.push(0x80);
+    out
+}
+
+fn absorb<F>(f: F, rate: usize, cap: usize, state: &mut State, input: &[u8])
+where
+    F: Fn(&mut State),
+{
+    let mut cursor = 0;
+    let mut words = vec![];
+    for _ in 0..25 {
+        words.push(
+            (input[cursor] as u64)
+                | ((input[cursor + 1] as u64) << 8)
+                | ((input[cursor + 2] as u64) << 16)
+                | ((input[cursor + 3] as u64) << 24)
+                | ((input[cursor + 4] as u64) << 32)
+                | ((input[cursor + 5] as u64) << 40)
+                | ((input[cursor + 6] as u64) << 48)
+                | ((input[cursor + 7] as u64) << 52),
+        );
+        cursor += 8;
+    }
+    for _ in 0..(input.len() / rate) {
+        let rest = words.split_off(rate);
+        words.append(&mut [0].repeat(cap));
+        state.xor(&words);
+        f(state);
+        words = rest;
+    }
+}
+
+fn squeeze<F>(f: F, rate: usize, state: &mut State, out_len: usize) -> Vec<u64>
+where
+    F: Fn(&mut State),
+{
+    let mut out = vec![];
+    loop {
+        if out.len() >= out_len {
+            out.truncate(out_len);
+            break;
+        }
+        f(state);
+        out.append(&mut state.first_n(rate));
+    }
+    out
+}
+
+/// implements keccak as found in FIPS 201.
+///
+/// Capacity (`cap`) and d (`out_len`) are in bits here, as specified. However,
+/// they are converted to lengths respective to quad-words before using the
+/// sponge functions, both of which make that assumption.
+pub fn keccak<'a, T: AsRef<&'a [u8]>>(dom: u8, cap: usize, out_len: usize, input: T) -> Vec<u8> {
+    let mut state = State::new();
+    let qwcap = cap / 8 / 8;
+    let qwol = out_len / 8 / 8;
+    let bit_rate = 1600 - cap;
+    let mut padded_input = input.as_ref().to_vec();
+    padded_input.append(&mut pad101(dom, bit_rate / 8, input.as_ref().len()));
+    absorb(
+        keccak_p,
+        bit_rate / 8 / 8,
+        qwcap,
+        &mut state,
+        &*padded_input,
+    );
+    let words = squeeze(keccak_p, bit_rate / 8 / 8, &mut state, qwol);
+    words.into_iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -52,21 +157,7 @@ mod test {
     macro_rules! expl {
         ($( $val:literal )* ) => {
             {
-              let bytes = vec![$($val),*];
-              let mut state = State::new();
-              let mut x = 0;
-              let mut y = 0;
-              for i in 0..25 {
-                  let cursor = i * 8;
-                  let u64slice = &bytes[cursor..cursor + 8];
-                  let mut val = 0;
-                  for j in 0..8 {
-                      val |= u64slice[j] << (j * 8);
-                  }
-                  state[x][y] = val;
-                  (x, y) = if x == 4 { (0, y + 1) } else { (x + 1, y) };
-              }
-              state
+              State::from(vec![$($val),*])
             }
         };
     }
