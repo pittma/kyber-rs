@@ -16,18 +16,40 @@ impl State {
         let (mut x, mut y) = (0, 0);
         for word in rhs {
             self.data[x][y] ^= *word;
-            (x, y) = if x == 4 { (0, y + 1) } else { (x + 1, y) };
+            (x, y) = Self::tick(x, y);
         }
     }
 
-    fn first_n(&self, n: usize) -> Vec<u64> {
-        let mut out = vec![];
+    fn first_n_bytes(&self, n: usize) -> Vec<u8> {
+        let mut count = 1;
         let (mut x, mut y) = (0, 0);
-        for _ in 0..n {
-            out.push(self.data[x][y]);
-            (x, y) = if x == 4 { (0, y + 1) } else { (x + 1, y) };
+        let mut word_cursor = 1;
+        let mut current_word = self.data[x][y];
+        let mut out = vec![current_word as u8];
+
+        loop {
+            // we've gotten all the bytes we're looking for.
+            if count == n {
+                break;
+            }
+            // The intra-word cursor has reached 8, so we need to move to the
+            // next word, update the matrix indices and reset current word.
+            if word_cursor % 8 == 0 {
+                (x, y) = Self::tick(x, y);
+                current_word = self.data[x][y];
+                word_cursor = 0;
+            }
+            out.push((current_word >> (word_cursor * 8)) as u8);
+            count += 1;
+            word_cursor += 1;
         }
+
         out
+    }
+
+    #[inline]
+    fn tick(x: usize, y: usize) -> (usize, usize) {
+        if x == 4 { (0, y + 1) } else { (x + 1, y) }
     }
 }
 
@@ -58,7 +80,7 @@ impl<T: AsRef<[u8]>> From<T> for State {
                 val |= (u64slice[j] as u64) << (j * 8);
             }
             state[x][y] = val;
-            (x, y) = if x == 4 { (0, y + 1) } else { (x + 1, y) };
+            (x, y) = Self::tick(x, y);
         }
         state
     }
@@ -89,7 +111,10 @@ where
 {
     let mut cursor = 0;
     let mut words = vec![];
-    for _ in 0..25 {
+    loop {
+        if cursor == input.len() {
+            break;
+        }
         words.push(
             (input[cursor] as u64)
                 | ((input[cursor + 1] as u64) << 8)
@@ -98,11 +123,12 @@ where
                 | ((input[cursor + 4] as u64) << 32)
                 | ((input[cursor + 5] as u64) << 40)
                 | ((input[cursor + 6] as u64) << 48)
-                | ((input[cursor + 7] as u64) << 52),
+                | ((input[cursor + 7] as u64) << 56),
         );
         cursor += 8;
     }
-    for _ in 0..(input.len() / rate) {
+    let num_chunks = words.len() / rate;
+    for _ in 0..num_chunks {
         let rest = words.split_off(rate);
         words.append(&mut [0].repeat(cap));
         state.xor(&words);
@@ -111,18 +137,18 @@ where
     }
 }
 
-fn squeeze<F>(f: F, rate: usize, state: &mut State, out_len: usize) -> Vec<u64>
+fn squeeze<F>(f: F, rate: usize, state: &mut State, out_len: usize) -> Vec<u8>
 where
     F: Fn(&mut State),
 {
-    let mut out = vec![];
+    let mut out = state.first_n_bytes(rate);
     loop {
         if out.len() >= out_len {
             out.truncate(out_len);
             break;
         }
         f(state);
-        out.append(&mut state.first_n(rate));
+        out.append(&mut state.first_n_bytes(rate));
     }
     out
 }
@@ -130,24 +156,21 @@ where
 /// implements keccak as found in FIPS 201.
 ///
 /// Capacity (`cap`) and d (`out_len`) are in bits here, as specified. However,
-/// they are converted to lengths respective to quad-words before using the
-/// sponge functions, both of which make that assumption.
-pub fn keccak<'a, T: AsRef<&'a [u8]>>(dom: u8, cap: usize, out_len: usize, input: T) -> Vec<u8> {
+/// they are converted to lengths in quad-words and bytes respectively before
+/// using the sponge functions to match these functions assumptions.
+pub fn keccak<T: AsRef<[u8]>>(dom: u8, cap: usize, out_len: usize, input: &T) -> Vec<u8> {
     let mut state = State::new();
     let qwcap = cap / 8 / 8;
-    let qwol = out_len / 8 / 8;
-    let bit_rate = 1600 - cap;
+    let byte_ol = out_len / 8;
+    let rate = (1600 - cap) / 8;
     let mut padded_input = input.as_ref().to_vec();
-    padded_input.append(&mut pad101(dom, bit_rate / 8, input.as_ref().len()));
-    absorb(
-        keccak_p,
-        bit_rate / 8 / 8,
-        qwcap,
-        &mut state,
-        &*padded_input,
-    );
-    let words = squeeze(keccak_p, bit_rate / 8 / 8, &mut state, qwol);
-    words.into_iter().flat_map(|x| x.to_le_bytes()).collect()
+    padded_input.append(&mut pad101(dom, rate, input.as_ref().len()));
+    absorb(keccak_p, rate / 8, qwcap, &mut state, &*padded_input);
+    squeeze(keccak_p, rate, &mut state, byte_ol)
+}
+
+pub fn sha3_512<T: AsRef<[u8]>>(input: &T) -> Vec<u8> {
+    keccak(0x06, 1024, 512, input)
 }
 
 #[cfg(test)]
@@ -155,6 +178,7 @@ mod test {
     use super::*;
 
     macro_rules! expl {
+
         ($( $val:literal )* ) => {
             {
               State::from(vec![$($val),*])
@@ -197,5 +221,46 @@ mod test {
         ];
         keccak_p(&mut state);
         assert_eq!(state, expected_state);
+    }
+
+    #[test]
+    fn first_n_bytes() {
+        let state = expl![
+            0xA6 0x9F 0x73 0xCC 0xA2 0x3A 0x9A 0xC5 0xC8 0xB5 0x67 0xDC 0x18 0x5A 0x75 0x6E
+            0x97 0xC9 0x82 0x16 0x4F 0xE2 0x58 0x59 0xE0 0xD1 0xDC 0xC1 0x47 0x5C 0x80 0xA6
+            0x15 0xB2 0x12 0x3A 0xF1 0xF5 0xF9 0x4C 0x11 0xE3 0xE9 0x40 0x2C 0x3A 0xC5 0x58
+            0xF5 0x00 0x19 0x9D 0x95 0xB6 0xD3 0xE3 0x01 0x75 0x85 0x86 0x28 0x1D 0xCD 0x26
+            0x36 0x4B 0xC5 0xB8 0xE7 0x8F 0x53 0xB8 0x23 0xDD 0xA7 0xF4 0xDE 0x9F 0xAD 0x00
+            0xE6 0x7D 0xB7 0x2F 0x9F 0x9F 0xEA 0x0C 0xE3 0xC9 0xFE 0xF1 0x5A 0x76 0xAD 0xC5
+            0x85 0xEB 0x2E 0xFD 0x11 0x87 0xFB 0x65 0xF9 0xC9 0xA2 0x73 0x31 0x51 0x67 0xE3
+            0x14 0xFA 0x68 0xB6 0xA3 0x22 0xD4 0x07 0x01 0x5D 0x50 0x2A 0xCD 0xEC 0x8C 0x88
+            0x5C 0x4F 0x77 0x84 0xCE 0xD0 0x46 0x09 0xBB 0x35 0x15 0x4A 0x96 0x48 0x4B 0x56
+            0x25 0xD3 0x41 0x7C 0x88 0x60 0x7A 0xCD 0xE4 0xC2 0xC9 0x9B 0xAE 0x5E 0xDF 0x9E
+            0xEA 0x2A 0xD0 0xFB 0x55 0xA2 0x26 0x18 0x9E 0x11 0xD2 0x49 0x60 0x43 0x3E 0x2B
+            0x0E 0xE0 0x45 0xA4 0x73 0x09 0x97 0x76 0xDD 0x5D 0xE7 0x39 0xDB 0x9B 0xA8 0x19
+            0xD5 0x4C 0xB9 0x03 0xA7 0xA5 0xD7 0xEE
+        ];
+
+        assert_eq!(state.first_n_bytes(3), vec![0xA6, 0x9F, 0x73]);
+        assert_eq!(
+            state.first_n_bytes(11),
+            vec![
+                0xA6, 0x9F, 0x73, 0xCC, 0xA2, 0x3A, 0x9A, 0xC5, 0xC8, 0xB5, 0x67
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_sha3_512() {
+        let expected = vec![
+            0xA6, 0x9F, 0x73, 0xCC, 0xA2, 0x3A, 0x9A, 0xC5, 0xC8, 0xB5, 0x67, 0xDC, 0x18, 0x5A,
+            0x75, 0x6E, 0x97, 0xC9, 0x82, 0x16, 0x4F, 0xE2, 0x58, 0x59, 0xE0, 0xD1, 0xDC, 0xC1,
+            0x47, 0x5C, 0x80, 0xA6, 0x15, 0xB2, 0x12, 0x3A, 0xF1, 0xF5, 0xF9, 0x4C, 0x11, 0xE3,
+            0xE9, 0x40, 0x2C, 0x3A, 0xC5, 0x58, 0xF5, 0x00, 0x19, 0x9D, 0x95, 0xB6, 0xD3, 0xE3,
+            0x01, 0x75, 0x85, 0x86, 0x28, 0x1D, 0xCD, 0x26,
+        ];
+        let input: [u8; 0] = [];
+        let out = sha3_512(&input);
+        assert_eq!(out, expected);
     }
 }

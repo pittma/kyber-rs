@@ -78,9 +78,6 @@ fn rc(round_num: u8) -> u64 {
             out |= 1 << ((1 << j) - 1)
         }
     }
-    if round_num == 1 {
-        println!("{:x}", out)
-    }
     out
 }
 
