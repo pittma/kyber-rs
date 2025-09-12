@@ -86,6 +86,72 @@ impl<T: AsRef<[u8]>> From<T> for State {
     }
 }
 
+struct Sponge<F, const N: usize> {
+    state: State,
+    f: F,
+    buffer: [u8; N],
+    cursor: usize,
+}
+
+impl<F, const N: usize> Sponge<F, N>
+where
+    F: Fn(&mut State),
+{
+    fn absorb(f: F, cap: usize, input: &[u8]) -> Self {
+        let mut state = State::new();
+        let mut cursor = 0;
+        let mut words = vec![];
+        loop {
+            if cursor == input.len() {
+                break;
+            }
+            words.push(
+                (input[cursor] as u64)
+                    | ((input[cursor + 1] as u64) << 8)
+                    | ((input[cursor + 2] as u64) << 16)
+                    | ((input[cursor + 3] as u64) << 24)
+                    | ((input[cursor + 4] as u64) << 32)
+                    | ((input[cursor + 5] as u64) << 40)
+                    | ((input[cursor + 6] as u64) << 48)
+                    | ((input[cursor + 7] as u64) << 56),
+            );
+            cursor += 8;
+        }
+        let num_chunks = words.len() / (N / 8);
+        for _ in 0..num_chunks {
+            let rest = words.split_off(N / 8);
+            words.append(&mut [0].repeat(cap));
+            state.xor(&words);
+            f(&mut state);
+            words = rest;
+        }
+
+        let mut buffer = [0; N];
+        buffer.copy_from_slice(&state.first_n_bytes(N));
+
+        Self {
+            cursor: 0,
+            f,
+            buffer,
+            state,
+        }
+    }
+
+    fn squeeze(&mut self, num_bytes: usize) -> Vec<u8> {
+        if self.cursor + num_bytes >= N {
+            self.cursor = 0;
+            (self.f)(&mut self.state);
+            self.buffer.copy_from_slice(&self.state.first_n_bytes(N));
+        }
+        let mut out = vec![];
+        for _ in 0..num_bytes {
+            out.push(self.buffer[self.cursor]);
+            self.cursor += 1;
+        }
+        out
+    }
+}
+
 /// Implements KECCAK-p, in place, on `state`.
 pub fn keccak_p(state: &mut State) {
     for i in 0..24 {
@@ -158,19 +224,22 @@ where
 /// Capacity (`cap`) and d (`out_len`) are in bits here, as specified. However,
 /// they are converted to lengths in quad-words and bytes respectively before
 /// using the sponge functions to match these functions assumptions.
-pub fn keccak<T: AsRef<[u8]>>(dom: u8, cap: usize, out_len: usize, input: &T) -> Vec<u8> {
+pub fn keccak<T: AsRef<[u8]>, const C: usize, const R: usize>(
+    dom: u8,
+    out_len: usize,
+    input: &T,
+) -> Vec<u8> {
     let mut state = State::new();
-    let qwcap = cap / 8 / 8;
+    let qwcap = C / 8 / 8;
     let byte_ol = out_len / 8;
-    let rate = (1600 - cap) / 8;
     let mut padded_input = input.as_ref().to_vec();
-    padded_input.append(&mut pad101(dom, rate, input.as_ref().len()));
-    absorb(keccak_p, rate / 8, qwcap, &mut state, &*padded_input);
-    squeeze(keccak_p, rate, &mut state, byte_ol)
+    padded_input.append(&mut pad101(dom, R / 8, input.as_ref().len()));
+    absorb(keccak_p, R / 8 / 8, qwcap, &mut state, &*padded_input);
+    squeeze(keccak_p, R / 8, &mut state, byte_ol)
 }
 
 pub fn sha3_512<T: AsRef<[u8]>>(input: &T) -> Vec<u8> {
-    keccak(0x06, 1024, 512, input)
+    keccak::<_, 1024, { 1600 - 1024 }>(0x06, 512, input)
 }
 
 #[cfg(test)]
