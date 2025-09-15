@@ -163,9 +163,9 @@ pub fn keccak_p(state: &mut State) {
     }
 }
 
-fn pad101(dom: u8, mod_len: usize, len: usize) -> Vec<u8> {
+fn pad101<const DOM: u8>(mod_len: usize, len: usize) -> Vec<u8> {
     let pad_len = mod_len - ((len + 2) % mod_len);
-    let mut out = vec![dom];
+    let mut out = vec![DOM];
     out.append(&mut [0].repeat(pad_len));
     out.push(0x80);
     out
@@ -176,19 +176,18 @@ fn pad101(dom: u8, mod_len: usize, len: usize) -> Vec<u8> {
 /// Capacity (`cap`) and d (`out_len`) are in bits here, as specified. However,
 /// they are converted to lengths in quad-words and bytes respectively before
 /// using the sponge functions to match these functions assumptions.
-pub fn keccak<T: AsRef<[u8]>, const C: usize, const R: usize>(
-    dom: u8,
+pub fn keccak<const DOM: u8, T: AsRef<[u8]>, const C: usize, const R: usize>(
     out_len: usize,
     input: &T,
 ) -> Vec<u8> {
     let mut padded_input = input.as_ref().to_vec();
-    padded_input.append(&mut pad101(dom, R, input.as_ref().len()));
+    padded_input.append(&mut pad101::<DOM>(R, input.as_ref().len()));
     let mut sponge = Sponge::<_, R>::absorb(keccak_p, C / 8 / 8, &*padded_input);
     sponge.squeeze(out_len / 8)
 }
 
 pub fn sha3_512<T: AsRef<[u8]>>(input: &T) -> Vec<u8> {
-    keccak::<_, 1024, { (1600 - 1024) / 8 }>(0x06, 512, input)
+    keccak::<0x06, _, 1024, { (1600 - 1024) / 8 }>(512, input)
 }
 
 #[cfg(test)]
