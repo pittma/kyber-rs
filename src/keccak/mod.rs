@@ -86,48 +86,55 @@ impl<T: AsRef<[u8]>> From<T> for State {
     }
 }
 
-pub struct Sponge<F, const N: usize> {
+/// A generic sponge implementation. Rate (`RATE`), domain (`DOM`), and capacity
+/// `CAP` are in bytes.
+///
+/// Callers may specify their parameters in bits to match the spec, but those
+/// must be converted to bytes before instantiating a Sponge.
+pub struct Sponge<F, const RATE: usize, const DOM: u8, const CAP: usize> {
     state: State,
     f: F,
-    buffer: [u8; N],
+    buffer: [u8; RATE],
     cursor: usize,
 }
 
-impl<F, const N: usize> Sponge<F, N>
+impl<F, const RATE: usize, const DOM: u8, const CAP: usize> Sponge<F, RATE, DOM, CAP>
 where
     F: Fn(&mut State),
 {
-    pub fn absorb(f: F, cap: usize, input: &[u8]) -> Self {
+    pub fn absorb_with(f: F, input: &[u8]) -> Self {
         let mut state = State::new();
         let mut cursor = 0;
         let mut words = vec![];
+        let mut padded_input = input.as_ref().to_vec();
+        padded_input.append(&mut Self::pad101(input.as_ref().len()));
         loop {
-            if cursor == input.len() {
+            if cursor == padded_input.len() {
                 break;
             }
             words.push(
-                (input[cursor] as u64)
-                    | ((input[cursor + 1] as u64) << 8)
-                    | ((input[cursor + 2] as u64) << 16)
-                    | ((input[cursor + 3] as u64) << 24)
-                    | ((input[cursor + 4] as u64) << 32)
-                    | ((input[cursor + 5] as u64) << 40)
-                    | ((input[cursor + 6] as u64) << 48)
-                    | ((input[cursor + 7] as u64) << 56),
+                (padded_input[cursor] as u64)
+                    | ((padded_input[cursor + 1] as u64) << 8)
+                    | ((padded_input[cursor + 2] as u64) << 16)
+                    | ((padded_input[cursor + 3] as u64) << 24)
+                    | ((padded_input[cursor + 4] as u64) << 32)
+                    | ((padded_input[cursor + 5] as u64) << 40)
+                    | ((padded_input[cursor + 6] as u64) << 48)
+                    | ((padded_input[cursor + 7] as u64) << 56),
             );
             cursor += 8;
         }
-        let num_chunks = words.len() / (N / 8);
+        let num_chunks = words.len() / (RATE / 8);
         for _ in 0..num_chunks {
-            let rest = words.split_off(N / 8);
-            words.append(&mut [0].repeat(cap));
+            let rest = words.split_off(RATE / 8);
+            words.append(&mut [0].repeat(CAP / 8));
             state.xor(&words);
             f(&mut state);
             words = rest;
         }
 
-        let mut buffer = [0; N];
-        buffer.copy_from_slice(&state.first_n_bytes(N));
+        let mut buffer = [0; RATE];
+        buffer.copy_from_slice(&state.first_n_bytes(RATE));
 
         Self {
             cursor: 0,
@@ -138,10 +145,10 @@ where
     }
 
     pub fn squeeze(&mut self, num_bytes: usize) -> Vec<u8> {
-        if self.cursor + num_bytes >= N {
+        if self.cursor + num_bytes >= RATE {
             self.cursor = 0;
             (self.f)(&mut self.state);
-            self.buffer.copy_from_slice(&self.state.first_n_bytes(N));
+            self.buffer.copy_from_slice(&self.state.first_n_bytes(RATE));
         }
         let mut out = vec![];
         for _ in 0..num_bytes {
@@ -149,6 +156,23 @@ where
             self.cursor += 1;
         }
         out
+    }
+
+    fn pad101(len: usize) -> Vec<u8> {
+        let pad_len = RATE - ((len + 2) % RATE);
+        let mut out = vec![DOM];
+        out.append(&mut [0].repeat(pad_len));
+        out.push(0x80);
+        out
+    }
+}
+
+type KeccakSponge<const RATE: usize, const DOM: u8, const CAP: usize> =
+    Sponge<fn(&mut State), RATE, DOM, CAP>;
+
+impl<const RATE: usize, const DOM: u8, const CAP: usize> KeccakSponge<RATE, DOM, CAP> {
+    fn absorb(input: &[u8]) -> Self {
+        Sponge::absorb_with(keccak_p, input)
     }
 }
 
@@ -163,31 +187,12 @@ pub fn keccak_p(state: &mut State) {
     }
 }
 
-fn pad101<const DOM: u8>(mod_len: usize, len: usize) -> Vec<u8> {
-    let pad_len = mod_len - ((len + 2) % mod_len);
-    let mut out = vec![DOM];
-    out.append(&mut [0].repeat(pad_len));
-    out.push(0x80);
-    out
-}
-
-/// implements keccak as found in FIPS 201.
-///
-/// Capacity (`cap`) and d (`out_len`) are in bits here, as specified. However,
-/// they are converted to lengths in quad-words and bytes respectively before
-/// using the sponge functions to match these functions assumptions.
-pub fn keccak<const DOM: u8, T: AsRef<[u8]>, const C: usize, const R: usize>(
-    out_len: usize,
-    input: &T,
-) -> Vec<u8> {
-    let mut padded_input = input.as_ref().to_vec();
-    padded_input.append(&mut pad101::<DOM>(R, input.as_ref().len()));
-    let mut sponge = Sponge::<_, R>::absorb(keccak_p, C / 8 / 8, &*padded_input);
-    sponge.squeeze(out_len / 8)
-}
-
 pub fn sha3_512<T: AsRef<[u8]>>(input: &T) -> Vec<u8> {
-    keccak::<0x06, _, 1024, { (1600 - 1024) / 8 }>(512, input)
+    const CAP_BITS: usize = 1024;
+    const CAP: usize = CAP_BITS / 8;
+    const RATE: usize = (1600 - CAP_BITS) / 8;
+    let mut sponge = KeccakSponge::<RATE, 0x06, CAP>::absorb(input.as_ref());
+    sponge.squeeze(512 / 8)
 }
 
 #[cfg(test)]
